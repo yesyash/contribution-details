@@ -1,3 +1,6 @@
+# Contribution details
+- A script to get details of all the prs created by you in a github organization.
+
 ## Steps to setup repository locally
 1. `npm i` to install packages.
 2. `cp .env.sample .env` to create a env file.
