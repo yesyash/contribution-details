@@ -1,42 +1,58 @@
-// Import the node-fetch library
+// --- Setup ---
+require('dotenv').config(); // Load environment variables from .env file FIRST
 const fetch = require('node-fetch');
+const fs = require('fs');
+const path = require('path');
 
-// --- Configuration ---
-// REQUIRED: Replace with your actual GitHub username
-const GITHUB_USERNAME = 'YOUR_GITHUB_USERNAME';
-// REQUIRED: Replace with the target GitHub organization name
-const GITHUB_ORG = 'YOUR_GITHUB_ORG';
-// REQUIRED: Replace with your GitHub Personal Access Token (PAT)
-const GITHUB_TOKEN = 'YOUR_GITHUB_PAT'; // Keep this secure!
+// --- Configuration from Environment Variables ---
+const GITHUB_USERNAME = process.env.GITHUB_USERNAME;
+const GITHUB_ORG = process.env.GITHUB_ORG;
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
 
 const START_DATE = '2024-04-01';
-const END_DATE = '2025-04-01'; // Note: GitHub search range includes the start date but might be exclusive of the end date depending on time, so this effectively covers up to March 31st, 2025 23:59:59 UTC.
+const END_DATE = '2025-04-01';
+const OUTPUT_FILENAME = 'github_prs_detailed_output.txt';
+const API_BASE_URL = 'https://api.github.com';
+// Delay between fetching PR details (in milliseconds) to help avoid rate limits
+const DETAIL_FETCH_DELAY_MS = 50;
 // --- End Configuration ---
 
-// Validate configuration
-if (
-    GITHUB_USERNAME === 'YOUR_GITHUB_USERNAME' ||
-    GITHUB_ORG === 'YOUR_GITHUB_ORG' ||
-    GITHUB_TOKEN === 'YOUR_GITHUB_PAT'
-) {
+// --- Validate Environment Variables ---
+// (Keep the validation block from the previous version)
+const requiredEnvVars = { GITHUB_USERNAME, GITHUB_ORG, GITHUB_TOKEN };
+const missingEnvVars = Object.entries(requiredEnvVars)
+    .filter(([key, value]) => !value)
+    .map(([key]) => key);
+
+if (missingEnvVars.length > 0) {
     console.error(
-        '❌ Error: Please replace placeholder values for GITHUB_USERNAME, GITHUB_ORG, and GITHUB_TOKEN in the script.'
+        `❌ Error: Missing required environment variables: ${missingEnvVars.join(', ')}.`
     );
+    console.error(
+        '   Please ensure they are set in your .env file or environment.'
+    );
+    console.error('   Example .env file contents:');
+    console.error('   GITHUB_USERNAME=your_user');
+    console.error('   GITHUB_ORG=your_org');
+    console.error('   GITHUB_TOKEN=your_pat');
     process.exit(1);
 }
+// --- End Validation ---
 
-const API_BASE_URL = 'https://api.github.com';
+// Helper function for adding delays
+const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 /**
  * Fetches all pages for a given GitHub search query.
- * @param {string} searchQuery - The GitHub search query string.
- * @returns {Promise<Array>} - A promise that resolves to an array of found items.
+ * (Keep the fetchAllPages function from the previous version - no changes needed here)
+ * @param {string} searchQuery
+ * @returns {Promise<Array>}
  */
 async function fetchAllPages(searchQuery) {
     let allItems = [];
     let page = 1;
     let hasNextPage = true;
-    const perPage = 100; // Max items per page allowed by GitHub API
+    const perPage = 100;
 
     console.log(`🚀 Starting GitHub PR search...`);
     console.log(`   Query: ${searchQuery}`);
@@ -46,25 +62,26 @@ async function fetchAllPages(searchQuery) {
             searchQuery
         )}&per_page=${perPage}&page=${page}`;
 
-        console.log(`   Fetching page ${page}...`);
+        console.log(`   Fetching search results page ${page}...`);
 
         try {
             const response = await fetch(url, {
                 headers: {
                     Accept: 'application/vnd.github.v3+json',
                     Authorization: `token ${GITHUB_TOKEN}`,
+                    'User-Agent': 'Node.js PR Detail Fetcher Script',
                 },
             });
 
-            // Check rate limit status (optional but good practice)
-            // const rateLimitRemaining = response.headers.get('x-ratelimit-remaining');
-            // const rateLimitReset = new Date(response.headers.get('x-ratelimit-reset') * 1000);
-            // console.log(`   Rate limit remaining: ${rateLimitRemaining}, resets at: ${rateLimitReset.toLocaleTimeString()}`);
-
             if (!response.ok) {
                 const errorBody = await response.text();
+                // Check for rate limit specific error
+                if (response.status === 403 && response.headers.get('x-ratelimit-remaining') === '0') {
+                     const rateLimitReset = new Date(response.headers.get('x-ratelimit-reset') * 1000);
+                     console.error(`❌ Rate limit exceeded. Try again after ${rateLimitReset.toLocaleTimeString()}.`);
+                }
                 throw new Error(
-                    `GitHub API Error: ${response.status} ${
+                    `GitHub API Error (Search): ${response.status} ${
                         response.statusText
                     }\nResponse: ${errorBody}`
                 );
@@ -74,21 +91,20 @@ async function fetchAllPages(searchQuery) {
 
             if (data.items && data.items.length > 0) {
                 allItems = allItems.concat(data.items);
+                console.log(`   Found ${data.items.length} items on page ${page}. Total so far: ${allItems.length}`);
             } else {
-                // No more items found on this page
                 hasNextPage = false;
             }
 
-            // Check for 'next' link in the Link header (most reliable way)
             const linkHeader = response.headers.get('Link');
             if (!linkHeader || !linkHeader.includes('rel="next"')) {
                 hasNextPage = false;
             }
 
-            // Safety break in case Link header logic fails or too many results
-            if (page >= 30) { // Limit to 30 pages (3000 results) as a safeguard
+             // Safety break
+            if (page >= 30) {
                 if (hasNextPage) {
-                    console.warn("⚠️ Warning: Reached page limit (30). Stopping pagination early.");
+                    console.warn("⚠️ Warning: Reached page limit (30) for search results. Stopping pagination early.");
                     hasNextPage = false;
                 }
             }
@@ -96,77 +112,168 @@ async function fetchAllPages(searchQuery) {
             page++;
 
         } catch (error) {
-            console.error(`❌ Error fetching page ${page}:`, error.message);
-            hasNextPage = false; // Stop trying on error
-            throw error; // Re-throw to stop the script
+            console.error(`❌ Error fetching search page ${page}:`, error.message);
+            hasNextPage = false;
+            throw error;
         }
     }
 
-    console.log(`✅ Finished fetching. Found ${allItems.length} total items matching query.`);
+    console.log(`✅ Finished search. Found ${allItems.length} total PRs matching query.`);
     return allItems;
 }
+
+/**
+ * Fetches detailed information for a single PR, including its body.
+ * @param {string} owner - The repository owner (user or org).
+ * @param {string} repo - The repository name.
+ * @param {number} pullNumber - The PR number.
+ * @returns {Promise<object|null>} - A promise resolving to the PR detail object or null on error.
+ */
+async function fetchPrDetails(owner, repo, pullNumber) {
+    const url = `${API_BASE_URL}/repos/${owner}/${repo}/pulls/${pullNumber}`;
+    // console.log(`      Fetching details for PR #${pullNumber} in ${owner}/${repo}...`); // Uncomment for verbose logging
+
+    try {
+        const response = await fetch(url, {
+            headers: {
+                Accept: 'application/vnd.github.v3+json',
+                Authorization: `token ${GITHUB_TOKEN}`,
+                'User-Agent': 'Node.js PR Detail Fetcher Script',
+            },
+        });
+
+        if (!response.ok) {
+             if (response.status === 403 && response.headers.get('x-ratelimit-remaining') === '0') {
+                 const rateLimitReset = new Date(response.headers.get('x-ratelimit-reset') * 1000);
+                 console.error(`❌ Rate limit exceeded while fetching details for PR #${pullNumber}. Try again after ${rateLimitReset.toLocaleTimeString()}.`);
+             } else if (response.status === 404) {
+                 console.warn(`⚠️ Could not find PR #${pullNumber} at ${url} (perhaps deleted or permissions issue).`);
+                 return null; // Return null for not found
+             }
+            throw new Error(
+                `GitHub API Error (PR Detail ${pullNumber}): ${response.status} ${response.statusText}`
+            );
+        }
+
+        const prData = await response.json();
+        return prData; // Return the full PR detail object
+
+    } catch (error) {
+        console.error(`❌ Error fetching details for PR #${pullNumber} in ${owner}/${repo}:`, error.message);
+        return null; // Return null indicating failure
+    }
+}
+
+/**
+ * Formats the PR list into a string for file output.
+ * @param {Array} prList - The sorted list of PR objects.
+ * @returns {string} - The formatted string.
+ */
+function formatPrListForFile(prList) {
+    let outputString = `--- Pull Requests created by ${GITHUB_USERNAME} in ${GITHUB_ORG} from ${START_DATE} to ${END_DATE} ---\n`;
+    outputString += `Total found and processed: ${prList.length}\n`;
+    outputString += `Generated on: ${new Date().toLocaleString()}\n\n`;
+    outputString += `==================================================\n`;
+
+    if (prList.length === 0) {
+        outputString += 'No matching pull requests found or processed.\n';
+    } else {
+        prList.forEach((pr, index) => {
+            outputString += `[${index + 1}]\n`;
+            outputString += `  Title:        ${pr.title}\n`;
+            outputString += `  Created At:   ${new Date(pr.createdAt).toLocaleString()}\n`;
+            outputString += `  Merged On:    ${pr.mergedAt ? new Date(pr.mergedAt).toLocaleString() : 'Not Merged'}\n`;
+            outputString += `  URL:          ${pr.url}\n`;
+            outputString += `  Description:\n${pr.description ? pr.description.split('\n').map(line => `    ${line}`).join('\n') : '    (No description provided or failed to fetch)'}\n`; // Indent description
+            outputString += `--------------------------------------------------\n`;
+        });
+    }
+    return outputString;
+}
+
 
 /**
  * Main function to get and process PRs.
  */
 async function main() {
-    // Construct the search query for GitHub API
-    // is:pr - Search only for Pull Requests
-    // author:{username} - Filter by the author
-    // org:{orgname} - Filter by the organization
-    // created:{startDate}..{endDate} - Filter by creation date range
     const searchQuery = `is:pr author:${GITHUB_USERNAME} org:${GITHUB_ORG} created:${START_DATE}..${END_DATE}`;
+    let prList = [];
 
     try {
         const searchResults = await fetchAllPages(searchQuery);
 
-        // Process the results to extract needed info and filter/format
-        const prList = searchResults
-            .map((item) => {
-                // The search API returns issue-like objects, PR info is nested
-                // Check if it has pull_request data and when it was merged
-                const mergedAt = item.pull_request?.merged_at; // Use optional chaining
+        if (searchResults.length === 0) {
+            console.log("No PRs found matching the search criteria.");
+        } else {
+            console.log(`\n🔍 Fetching details for ${searchResults.length} PRs... (This may take a while due to rate limits and delays)`);
 
-                return {
+            let processedCount = 0;
+            // Fetch details for each PR sequentially with a delay
+            for (const item of searchResults) {
+                processedCount++;
+                const repoUrlParts = item.repository_url.split('/');
+                const owner = repoUrlParts[repoUrlParts.length - 2];
+                const repo = repoUrlParts[repoUrlParts.length - 1];
+                const pullNumber = item.number;
+
+                // Optional: Log progress
+                if (processedCount % 10 === 0 || processedCount === searchResults.length) {
+                    console.log(`   Processing PR ${processedCount} of ${searchResults.length} (#${pullNumber} in ${owner}/${repo})...`);
+                }
+
+                const prDetails = await fetchPrDetails(owner, repo, pullNumber);
+
+                prList.push({
                     title: item.title,
                     createdAt: item.created_at,
-                    mergedAt: mergedAt ? mergedAt : null, // Store null if not merged
+                    // Use merged_at from the detail fetch if available, otherwise fallback to search result
+                    mergedAt: prDetails?.merged_at || item.pull_request?.merged_at || null,
                     url: item.html_url,
-                };
-            });
+                    // Get the body (description) from the detailed fetch
+                    description: prDetails?.body || null, // Store null if no body or detail fetch failed
+                });
+
+                // Add a delay to avoid hitting rate limits when fetching details
+                if (DETAIL_FETCH_DELAY_MS > 0) {
+                   await delay(DETAIL_FETCH_DELAY_MS);
+                }
+            }
+             console.log(`✅ Finished fetching details for ${prList.length} PRs.`);
+        }
+
 
         // Sort the list by mergedAt date (ascending). Unmerged PRs (null) go last.
         prList.sort((a, b) => {
             const dateA = a.mergedAt ? new Date(a.mergedAt) : null;
             const dateB = b.mergedAt ? new Date(b.mergedAt) : null;
 
-            if (dateA === null && dateB === null) return 0; // Both unmerged, keep original relative order
-            if (dateA === null) return 1; // a is unmerged, sort after b
-            if (dateB === null) return -1; // b is unmerged, sort after a
-            return dateA - dateB; // Both merged, sort by date
+            if (dateA === null && dateB === null) return 0;
+            if (dateA === null) return 1;
+            if (dateB === null) return -1;
+            return dateA - dateB;
         });
 
-        // Print the results
-        console.log(
-            `\n--- Pull Requests created by ${GITHUB_USERNAME} in ${GITHUB_ORG} from ${START_DATE} to ${END_DATE} ---`
-        );
-        console.log(`Total found: ${prList.length}\n`);
+        // Format the output for the file
+        const fileContent = formatPrListForFile(prList);
 
-        if (prList.length === 0) {
-            console.log('No matching pull requests found.');
-        } else {
-            prList.forEach((pr, index) => {
-                console.log(`[${index + 1}]`);
-                console.log(`  Title:      ${pr.title}`);
-                console.log(`  Created At: ${new Date(pr.createdAt).toLocaleString()}`);
-                console.log(`  Merged On:  ${pr.mergedAt ? new Date(pr.mergedAt).toLocaleString() : 'Not Merged'}`);
-                console.log(`  URL:        ${pr.url}`);
-                console.log('---');
-            });
+        // Write the output to a file
+        const outputFilePath = path.join(__dirname, OUTPUT_FILENAME);
+        console.log(`\n💾 Writing output to: ${outputFilePath}`);
+        try {
+            fs.writeFileSync(outputFilePath, fileContent, 'utf8');
+            console.log(`✅ Successfully wrote PR list to ${OUTPUT_FILENAME}`);
+        } catch (writeError) {
+            console.error(`❌ Error writing to file ${outputFilePath}:`, writeError);
         }
+
     } catch (error) {
-        console.error('\n❌ An error occurred during the process:');
-        console.error(error.message);
+        console.error('\n❌ An critical error occurred during the process:');
+        // Don't log the full error object if it might contain sensitive info like the token in URLs
+        if (error.message) {
+            console.error(error.message);
+        } else {
+            console.error(error);
+        }
         process.exit(1);
     }
 }
